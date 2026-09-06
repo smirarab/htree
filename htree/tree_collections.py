@@ -290,65 +290,25 @@ class Tree:
         """
         if dim is None:
             raise ValueError("Parameter 'dim' is required.")
-        # Parameter defaults
-        defaults = {
-            'precise_opt': conf.ENABLE_ACCURATE_OPTIMIZATION, 'epochs': conf.TOTAL_EPOCHS,
-            'lr_init': conf.INITIAL_LEARNING_RATE, 'dist_cutoff': conf.MAX_RANGE,
-            'export_video': conf.ENABLE_VIDEO_EXPORT, 'save_mode': conf.ENABLE_SAVE_MODE,
-            'scale_fn': None, 'lr_fn': None, 'weight_exp_fn': None, 'curvature': None,
-        }
-        params = {k: kwargs.get(k, v) for k, v in defaults.items()}
-        params['save_mode'] |= params['export_video']
-        params['export_video'] &= params['precise_opt']
-        is_hyperbolic = geometry == 'hyperbolic'
         try:
-            dist_matrix, curvature = self.distance_matrix()[0], None
-            # Hyperbolic: scale distances and compute curvature
-            if is_hyperbolic:
-                if params['curvature'] is not None and params['curvature'] >= 0:
-                    self._log("Wrong input curvature. It has to be negative.")
-                    print("Wrong input curvature. It has to be negative.")
-                    return None
-                if params['curvature'] is not None:
-                    curvature, params['scale_fn'] = params['curvature'], lambda x1, x2, x3: False
-                    scale = np.sqrt(-curvature)
-                else:
-                    scale = params['dist_cutoff'] / self.diameter()
-                    curvature = -(scale ** 2)
-                dist_matrix = dist_matrix * scale
-            # Naive embedding initialization
-            self._log(f"Computing naive {geometry} embedding...")
-            points = utils.naive_embedding(dist_matrix, dim, geometry=geometry)
-            self._log(f"Naive {geometry} embedding complete.")
-            # Precise optimization refinement
-            if params['precise_opt']:
-                self._log(f"Refining with precise {geometry} optimization...")
-                opt_result = utils.precise_embedding(
-                    dist_matrix, dim, geometry=geometry, init_pts=points,
-                    log_fn=self._log, time_stamp=self._timestamp, **params)
-                points, opt_scale = (opt_result, 1) if not is_hyperbolic else opt_result
-                curvature = curvature * opt_scale ** 2 if is_hyperbolic else None
-                self._log(f"Precise {geometry} embedding complete.")
-            # Construct embedding object
-            labels = self.terminal_names()
-            result = (embedding.LoidEmbedding(points=points, labels=labels, curvature=curvature)
-                      if is_hyperbolic else embedding.EuclideanEmbedding(points=points, labels=labels))
+            dist_matrix, labels = self.distance_matrix()
+            result = embedding.Embedding.from_distance_matrix(
+                dist_matrix,
+                labels,
+                dim,
+                geometry=geometry,
+                log_fn=self._log,
+                time_stamp=self._timestamp,
+                **kwargs
+            )
         except Exception as e:
             self._log(f"Embedding error: {e}")
             raise
-        # Save embedding to timestamped directory
-        out_dir = os.path.join(conf.OUTPUT_DIRECTORY, self._timestamp.strftime('%Y-%m-%d_%H-%M-%S'))
-        os.makedirs(out_dir, exist_ok=True)
-        filepath = os.path.join(out_dir, f"{geometry}_embedding_{dim}d.pkl")
-        try:
-            with open(filepath, 'wb') as f:
-                pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
-            self._log(f"Embedding saved to {filepath}")
-        except (IOError, pickle.PicklingError) as e:
-            self._log(f"Save error: {e}")
-            raise
-        if params['export_video']:
-            self._generate_video(fps=params['epochs'] // conf.VIDEO_LENGTH)
+        export_video = kwargs.get('export_video', conf.ENABLE_VIDEO_EXPORT)
+        precise_opt = kwargs.get('precise_opt', conf.ENABLE_ACCURATE_OPTIMIZATION)
+        epochs = kwargs.get('epochs', conf.TOTAL_EPOCHS)
+        if export_video and precise_opt:
+            self._generate_video(fps=epochs // conf.VIDEO_LENGTH)
         return result
 
     def _generate_video(self, fps: int = 10) -> None:

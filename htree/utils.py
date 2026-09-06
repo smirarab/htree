@@ -111,6 +111,7 @@ def naive_embedding(
         else:
             # Full spectrum requested: materialize Gram matrix and use dense solver
             evals_all, evecs_all = np.linalg.eigh(G)  # ascending order
+            eigenvalues, eigenvectors = evals_all, evecs_all
         # eigh returns ascending order — reverse to descending
         eigenvalues = eigenvalues[::-1].copy()
         eigenvectors = eigenvectors[:, ::-1].copy()

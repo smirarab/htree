@@ -184,6 +184,162 @@ class Embedding:
         """
         raise NotImplementedError("distance_matrix must be implemented by a subclass")
     ################################################################################################
+    @staticmethod
+    def _prepare_distance_matrix(
+        dist: Union[np.ndarray, torch.Tensor, list],
+        labels: Optional[List[Union[str, int]]] = None
+    ) -> torch.Tensor:
+        """Validate and normalize a supplied pairwise distance matrix."""
+        dist_matrix = torch.as_tensor(dist, dtype=torch.float64)
+        if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
+            raise ValueError("'dist' must be a square pairwise distance matrix.")
+        if dist_matrix.shape[0] == 0:
+            raise ValueError("'dist' must contain at least one point.")
+        if labels is not None and len(labels) != dist_matrix.shape[0]:
+            raise ValueError("The number of labels must match the distance matrix size.")
+        if not torch.isfinite(dist_matrix).all():
+            raise ValueError("'dist' must contain only finite values.")
+        if torch.any(dist_matrix < 0):
+            raise ValueError("'dist' cannot contain negative distances.")
+        if not torch.allclose(dist_matrix, dist_matrix.T, atol=conf.ERROR_TOLERANCE):
+            raise ValueError("'dist' must be symmetric.")
+
+        dist_matrix = 0.5 * (dist_matrix + dist_matrix.T)
+        dist_matrix.fill_diagonal_(0)
+        return dist_matrix
+    ################################################################################################
+    @staticmethod
+    def from_distance_matrix(
+        dist: Union[np.ndarray, torch.Tensor, list],
+        labels: Optional[List[Union[str, int]]],
+        dim: int,
+        geometry: str = 'hyperbolic',
+        **kwargs
+    ) -> 'Embedding':
+        """
+        Embed a supplied pairwise distance matrix directly.
+
+        Args:
+            dist: Square pairwise distance matrix.
+            labels: Labels corresponding to distance matrix rows/columns.
+            dim: Target embedding dimension.
+            geometry: Target geometry ('euclidean' or 'hyperbolic').
+            **kwargs: Same embedding controls used by Tree.embed, plus optional
+                save_embedding, output_dir, time_stamp, and log_fn.
+
+        Returns:
+            EuclideanEmbedding or LoidEmbedding depending on target geometry.
+        """
+        if dim is None:
+            raise ValueError("Parameter 'dim' is required.")
+        if geometry not in {'euclidean', 'hyperbolic'}:
+            raise ValueError("Invalid geometry type. Choose either 'euclidean' or 'hyperbolic'.")
+
+        defaults = {
+            'precise_opt': conf.ENABLE_ACCURATE_OPTIMIZATION,
+            'epochs': conf.TOTAL_EPOCHS,
+            'lr_init': conf.INITIAL_LEARNING_RATE,
+            'dist_cutoff': conf.MAX_RANGE,
+            'export_video': conf.ENABLE_VIDEO_EXPORT,
+            'save_mode': conf.ENABLE_SAVE_MODE,
+            'scale_fn': None,
+            'lr_fn': None,
+            'weight_exp_fn': None,
+            'curvature': None,
+            'time_stamp': get_time() or datetime.now(),
+            'log_fn': None,
+            'output_dir': None,
+            'save_embedding': True,
+        }
+        params = {k: kwargs.get(k, v) for k, v in defaults.items()}
+        params['save_mode'] |= params['export_video']
+        params['export_video'] &= params['precise_opt']
+
+        log_fn = params['log_fn']
+        dist_matrix = Embedding._prepare_distance_matrix(dist, labels)
+        labels = labels if labels is not None else list(range(dist_matrix.shape[0]))
+        is_hyperbolic = geometry == 'hyperbolic'
+        curvature = None
+
+        if is_hyperbolic:
+            if params['curvature'] is not None:
+                curvature = torch.as_tensor(params['curvature'], dtype=dist_matrix.dtype, device=dist_matrix.device)
+                if torch.any(curvature >= 0):
+                    raise ValueError("Curvature must be negative for hyperbolic geometry.")
+                params['scale_fn'] = lambda x1, x2, x3=None: False
+                scale = torch.sqrt(torch.abs(curvature))
+            else:
+                max_dist = torch.max(dist_matrix)
+                if max_dist <= 0:
+                    raise ValueError("Hyperbolic embedding requires at least one positive distance.")
+                scale = torch.as_tensor(params['dist_cutoff'], dtype=dist_matrix.dtype, device=dist_matrix.device) / max_dist
+                curvature = -(scale ** 2)
+            dist_for_embedding = dist_matrix * scale
+        else:
+            dist_for_embedding = dist_matrix ** 2
+
+        if log_fn:
+            log_fn(f"Computing naive {geometry} embedding from distance matrix...")
+        points = utils.naive_embedding(dist_for_embedding, dim, geometry=geometry)
+        if log_fn:
+            log_fn(f"Naive {geometry} embedding complete.")
+
+        if params['precise_opt']:
+            if log_fn:
+                log_fn(f"Refining with precise {geometry} optimization...")
+            precise_params = {
+                'epochs': params['epochs'],
+                'lr_init': params['lr_init'],
+                'save_mode': params['save_mode'],
+                'scale_fn': params['scale_fn'],
+                'lr_fn': params['lr_fn'],
+                'weight_exp_fn': params['weight_exp_fn'],
+                'time_stamp': params['time_stamp'],
+                'log_fn': log_fn,
+            }
+            opt_result = utils.precise_embedding(
+                dist_for_embedding, dim, geometry=geometry, init_pts=points, **precise_params
+            )
+            points, opt_scale = (opt_result, 1) if not is_hyperbolic else opt_result
+            curvature = curvature * opt_scale ** 2 if is_hyperbolic else None
+            if log_fn:
+                log_fn(f"Precise {geometry} embedding complete.")
+
+        result = (
+            LoidEmbedding(points=points, labels=labels, curvature=curvature)
+            if is_hyperbolic else EuclideanEmbedding(points=points, labels=labels)
+        )
+
+        if params['save_embedding']:
+            out_dir = params['output_dir'] or os.path.join(
+                conf.OUTPUT_DIRECTORY,
+                params['time_stamp'].strftime('%Y-%m-%d_%H-%M-%S')
+            )
+            os.makedirs(out_dir, exist_ok=True)
+            filepath = os.path.join(out_dir, f"{geometry}_embedding_{dim}d.pkl")
+            try:
+                with open(filepath, 'wb') as f:
+                    pickle.dump(result, f, protocol=pickle.HIGHEST_PROTOCOL)
+                if log_fn:
+                    log_fn(f"Embedding saved to {filepath}")
+            except (IOError, pickle.PicklingError) as e:
+                if log_fn:
+                    log_fn(f"Save error: {e}")
+                raise
+
+        return result
+    ################################################################################################
+    @staticmethod
+    def embed_dist(
+        dim: int,
+        dist: Union[np.ndarray, torch.Tensor, list],
+        labels: Optional[List[Union[str, int]]],
+        geometry: str = 'hyperbolic',
+        **kwargs
+    ) -> 'Embedding':
+        """Backward-compatible spelling for direct distance-matrix embedding."""
+        return Embedding.from_distance_matrix(dist=dist, labels=labels, dim=dim, geometry=geometry, **kwargs)
+    ################################################################################################
     def save(self, filename: str) -> None:
         """
         Saves the Embedding instance to a file using pickle.
@@ -1074,6 +1230,26 @@ class EuclideanEmbedding(Embedding):
 
         return embedding
 #############################################################################################
+def embed_dist(
+    dim: int,
+    dist: Union[np.ndarray, torch.Tensor, list],
+    labels: Optional[List[Union[str, int]]],
+    geometry: str = 'hyperbolic',
+    **kwargs
+) -> 'Embedding':
+    """Embed a supplied pairwise distance matrix using the notebook-compatible name."""
+    return Embedding.embed_dist(dim=dim, dist=dist, labels=labels, geometry=geometry, **kwargs)
+#############################################################################################
+def embed_distance_matrix(
+    dist: Union[np.ndarray, torch.Tensor, list],
+    labels: Optional[List[Union[str, int]]],
+    dim: int,
+    geometry: str = 'hyperbolic',
+    **kwargs
+) -> 'Embedding':
+    """Embed a supplied pairwise distance matrix directly."""
+    return Embedding.from_distance_matrix(dist=dist, labels=labels, dim=dim, geometry=geometry, **kwargs)
+#############################################################################################
 #############################################################################################
 #############################################################################################
 class MultiEmbedding:
@@ -1337,7 +1513,9 @@ class MultiEmbedding:
                 'scale_fn': None,
                 'lr_fn': None,
                 'weight_exp_fn': None,
-                'func' : torch.nanmean
+                'func' : torch.nanmean,
+                'save_embedding': True,
+                'output_dir': None,
             }.items()
         }
 
@@ -1345,47 +1523,21 @@ class MultiEmbedding:
         
         try:
             dist_mat = self.distance_matrix(func=params['func'])[0]
-            scale_factor = torch.sqrt(torch.abs(self.curvature)) if geometry == 'hyperbolic' else None
-            if scale_factor is not None:
-                dist_mat = dist_mat * scale_factor
-            
-            # Naive embedding
-            self._log_info(f"Initiating naive {geometry} embedding.")
-            points = utils.naive_embedding(dist_mat, self.dimension, geometry)
-            self._log_info(f"Naive {geometry} embedding completed.")
-            
+            helper_params = {k: v for k, v in params.items() if k != 'func'}
             if geometry == 'hyperbolic':
-                embedding = LoidEmbedding(points=points, labels=self.labels(), curvature=-(scale_factor ** 2))
-            else:
-                embedding = EuclideanEmbedding(points=points, labels=self.labels())
-            
-            if params['precise_opt']:
-                self._log_info(f"Initiating precise {geometry} embedding.")
-                pts_list, curvature = utils.precise_embedding(
-                    dist_mat, self.dimension, geometry, init_pts=points,
-                    epochs=params['epochs'], log_fn=self._log_info, lr_fn=params['lr_fn'],
-                    scale_fn=(lambda x1, x2, x3=None: False) if geometry == 'hyperbolic' else params['scale_fn'],
-                    weight_exp_fn=params['weight_exp_fn'], lr_init=params['lr_init'],
-                    save_mode=params['save_mode'], time_stamp=self._current_time
-                )
-                embedding.points = pts_list[0] if isinstance(pts_list, list) else pts_list
-                if geometry == 'hyperbolic':
-                    embedding.curvature *= curvature
-                self._log_info(f"Precise {geometry} embedding completed.")
+                helper_params['curvature'] = self.curvature
+            embedding = Embedding.from_distance_matrix(
+                dist_mat,
+                self.labels(),
+                self.dimension,
+                geometry=geometry,
+                log_fn=self._log_info,
+                time_stamp=self._current_time,
+                **helper_params
+            )
                 
         except Exception as e:
             self._log_info(f"Error during embedding: {e}")
-            raise
-
-        directory = f"{conf.OUTPUT_DIRECTORY}/{self._current_time.strftime('%Y-%m-%d_%H-%M-%S')}"
-        filepath = f"{directory}/{geometry}_embedding_{self.dimension}d.pkl"
-        os.makedirs(directory, exist_ok=True)
-        try:
-            with open(filepath, 'wb') as file:
-                pickle.dump(embedding, file)
-            self._log_info(f"Object successfully saved to {filepath}")
-        except (IOError, pickle.PicklingError, Exception) as e:
-            self._log_info(f"Error while saving object: {e}")
             raise
 
         return embedding
