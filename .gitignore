@@ -1,0 +1,14 @@
+.codex-tools/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local OS/editor files
+.DS_Store
