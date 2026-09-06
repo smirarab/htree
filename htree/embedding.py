@@ -126,6 +126,18 @@ class Embedding:
         self._log_info(f"Updated points with shape={self._points.shape}")
     ################################################################################################
     @property
+    def n_points(self) -> int:
+        """Gets the number of point columns from the current points tensor."""
+        return self._points.size(1) if self._points.numel() > 0 else 0
+    ################################################################################################
+    @n_points.setter
+    def n_points(self, value: int) -> None:
+        """
+        Accepts legacy dimension updates while keeping n_points derived from points.
+        """
+        self._n_points = value
+    ################################################################################################
+    @property
     def labels(self) -> List[Union[str, int]]:
         """Gets the labels corresponding to the points."""
         return self._labels
@@ -146,6 +158,14 @@ class Embedding:
             raise ValueError("The number of labels must match the number of points")
         self._labels = value
         self._log_info(f"Updated labels with length={len(self._labels)}")
+    ################################################################################################
+    def subset_points(self, indices: List[int]) -> None:
+        """
+        Keeps only the selected point columns and their corresponding labels.
+        """
+        self.points = self._points[:, indices]
+        self._labels = [self._labels[i] for i in indices]
+        self._log_info(f"Subset points to shape={self._points.shape}")
     ################################################################################################
     def _update_dimensions(self) -> None:
         """Updates the dimension based on the points. Must be implemented by a subclass."""

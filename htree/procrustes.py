@@ -170,17 +170,16 @@ class HyperbolicProcrustes:
         target_embedding = self.target_embedding.copy()
 
         # Filter points by intersecting labels
-        source_labels = set(src_embedding._labels)
         target_labels = set(target_embedding._labels)
-        common_labels = list(source_labels & target_labels)
+        common_labels = [label for label in src_embedding._labels if label in target_labels]
         if not common_labels:
             raise ValueError("No matching labels found between source and target embeddings.")
         
         src_indices = [src_embedding._labels.index(label) for label in common_labels]
         target_indices = [target_embedding._labels.index(label) for label in common_labels]
 
-        src_embedding._points = src_embedding._points[:, src_indices]
-        target_embedding._points = target_embedding._points[:, target_indices]
+        src_embedding.subset_points(src_indices)
+        target_embedding.subset_points(target_indices)
 
 
         src_center = src_embedding.centroid()
@@ -203,11 +202,11 @@ class HyperbolicProcrustes:
         self._mapping_matrix = transformation  # Default mode
         
         srouce_embedding = self.source_embedding.copy()
-        srouce_embedding._points = srouce_embedding._points[:, src_indices]
+        srouce_embedding.subset_points(src_indices)
         srouce_embedding._points = self._mapping_matrix @srouce_embedding._points
         
         target_embedding = self.target_embedding.copy()
-        target_embedding._points = target_embedding._points[:, target_indices]
+        target_embedding.subset_points(target_indices)
 
         if precise_opt:
             src_points = srouce_embedding._points
@@ -352,9 +351,8 @@ class EuclideanProcrustes:
         trg_embedding.center()
 
         # Filter points by intersecting labels
-        source_labels = set(src_embedding._labels)
         target_labels = set(trg_embedding._labels)
-        common_labels = list(source_labels & target_labels)
+        common_labels = [label for label in src_embedding._labels if label in target_labels]
         if not common_labels:
             raise ValueError("No matching labels found between source and target embeddings.")
 
@@ -362,8 +360,8 @@ class EuclideanProcrustes:
         src_indices = [src_embedding._labels.index(label) for label in common_labels]
         target_indices = [trg_embedding._labels.index(label) for label in common_labels]
 
-        src_embedding._points = src_embedding._points[:, src_indices]
-        trg_embedding._points = trg_embedding._points[:, target_indices]
+        src_embedding.subset_points(src_indices)
+        trg_embedding.subset_points(target_indices)
 
         # Compute optimal rotation matrix using SVD
         U, _, Vt = torch.svd(torch.mm(trg_embedding.points, src_embedding.points.T))
