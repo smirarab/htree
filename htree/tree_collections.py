@@ -696,66 +696,56 @@ class MultiTree:
             aligned[indices[:, None], indices] = tree.distance_matrix()[0]
             aligned.fill_diagonal_(0.0)
             return aligned
-        def unwrap(result: torch.Tensor | tuple) -> torch.Tensor:
-            """Extract tensor from aggregation result (handles nanmedian)."""
-            return result[0] if isinstance(result, tuple) else result
         # Parallel matrix computation
         dist_stack = torch.stack(Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(align_tree_matrix)(tree) for tree in tqdm(self.trees, desc="Aligning trees")
         ))
-        valid_mask = ~torch.isnan(dist_stack)
-        confidence = valid_mask.float().mean(dim=0)
-        tol = 1e-14
-        if method == "fp":
-            # ============================================================
-            # OPTIMIZED FIXED-POINT WITH ANDERSON ACCELERATION (m=2)
-            # ============================================================
-            # Warm start: median is an excellent robust initial estimate
-            D = self.distance_matrix(func = torch.nanmedian)[0]
-            D.fill_diagonal_(0.0)
-            # Pre-compute constants (avoid repeated allocations/computations)
-            dist_clean, valid_float = dist_stack.nan_to_num(0.0), valid_mask.float()
-            neg_inv_2sigma2 = -0.5 / (sigma_max ** 2)
-            # Anderson acceleration history (m=2 is optimal for this problem class)
-            G_prev, D_prev = None, None
-            pbar = tqdm(range(max_iter), desc="Fixed-point iteration")
-            for _ in pbar:
-                # Compute G(D) = Gaussian-weighted mean (fused operations)
-                residuals = dist_clean - D.unsqueeze(0)
-                weights = torch.exp(residuals.square().mul_(neg_inv_2sigma2)).mul_(valid_float)
-                G = weights.mul(dist_clean).sum(dim=0).div_(weights.sum(dim=0).clamp_(min=tol))
-                G.fill_diagonal_(0.0)
-                # Convergence check (before acceleration to measure true residual)
-                F = G - D
-                pbar.set_postfix({"residual": f"{(max_residual := F.abs().max().item()):.2e}"})
-                if max_residual < tol:
-                    D = G
-                    break
-                # Anderson acceleration: extrapolate using secant-like update
-                D_new = G
-                if G_prev is not None:
-                    # dG = G - G_prev, dD = D - D_prev
-                    # Optimal mixing: theta = -<F, dG-dD> / ||dG-dD||^2
-                    dG, dD = G - G_prev, D - D_prev
-                    dF = dG - dD  # change in residual
-                    dF_flat, F_flat = dF.view(-1), F.view(-1)
-                    if (denom := dF_flat.dot(dF_flat)) > tol:
-                        # Clamp for stability, allow slight extrapolation
-                        D_new = G + max(-0.5, min(-F_flat.dot(dF_flat) / denom, 2.0)) * dG
-                # Store history for next iteration
-                G_prev, D_prev, D = G, D, D_new
-                D.fill_diagonal_(0.0)
-            pbar.close()
-            self._log("Distance matrix computation complete.")
-            return D, confidence, labels
-        # Standard aggregation
-        avg_matrix = unwrap(func(dist_stack, dim=0))
-        # Interpolate remaining NaNs using row/column means
-        if (nan_mask := torch.isnan(avg_matrix)).any():
-            row_mean, col_mean = unwrap(func(avg_matrix, dim=1)), unwrap(func(avg_matrix, dim=0))
-            avg_matrix = torch.where(nan_mask, (row_mean[:, None] + col_mean[None, :]) / 2, avg_matrix)
+        avg_matrix, confidence = utils.aggregate_distance_stack(
+            dist_stack,
+            method=method,
+            func=func,
+            max_iter=max_iter,
+            tol=tol,
+            sigma_max=sigma_max,
+        )
         self._log("Distance matrix computation complete.")
         return avg_matrix, confidence, labels
+
+    def reference_embedding(
+        self,
+        dim: int,
+        geometry: str = 'hyperbolic',
+        method: str = "agg",
+        func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean,
+        max_iter: int = 1000,
+        n_jobs: int = -1,
+        tol: float = 1e-10,
+        sigma_max: float = 3.0,
+        **kwargs,
+    ) -> 'embedding.Embedding':
+        """
+        Embed an aggregate distance matrix computed directly from the trees.
+
+        This is useful when the reference should summarize the original tree
+        distances rather than distances induced by existing embeddings.
+        """
+        dist_matrix, _, labels = self.distance_matrix(
+            method=method,
+            func=func,
+            max_iter=max_iter,
+            n_jobs=n_jobs,
+            tol=tol,
+            sigma_max=sigma_max,
+        )
+        return embedding.Embedding.from_distance_matrix(
+            dist_matrix,
+            labels,
+            dim,
+            geometry=geometry,
+            log_fn=self._log,
+            time_stamp=self._timestamp,
+            **kwargs,
+        )
     
     def normalize(self, batch_mode: bool = False) -> List[float]:
         """

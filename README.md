@@ -1295,9 +1295,10 @@ def __init__(self)
   + `scale_fn`: See `embed` method in class `Tree`.
   + `lr_fn`: See `embed` method in class `Tree`.
   + `weight_exp_fn`: See `embed` method in class `Tree`.
-  + `func`: A function to compute the aggregate distance matrix (default is `torch.nanmean`).
--  **`distance_matrix(func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean)`**: Computes the aggregated distance matrix from all embeddings, replacing any missing values with estimates.
--  **`reference_embedding(func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean, **kwargs)`**: Generates a reference embedding based on the average (using function `func) distance matrix of all embeddings. For other variables, refer to `embed` method in class `Tree`.
+  + `method`: Aggregation method (`"agg"` or `"fp"`).
+  + `func`: A function to compute the aggregate distance matrix when `method="agg"` (default is `torch.nanmean`).
+-  **`distance_matrix(method: str = "agg", func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean)`**: Computes the aggregated distance matrix from all embeddings, replacing any missing values with estimates. Use `method="fp"` for Gaussian fixed-point aggregation.
+-  **`reference_embedding(method: str = "agg", func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean, **kwargs)`**: Generates a reference embedding based on the aggregate distance matrix of all embeddings. For other variables, refer to `embed` method in class `Tree`.
 
 ## Example: Initialization
 The following example demonstrates how to initialize the `MultiEmbedding` class, add embeddings, and compute the aggregated distance matrix.

@@ -190,7 +190,12 @@ class Embedding:
         labels: Optional[List[Union[str, int]]] = None
     ) -> torch.Tensor:
         """Validate and normalize a supplied pairwise distance matrix."""
-        dist_matrix = torch.as_tensor(dist, dtype=torch.float64)
+        if isinstance(dist, torch.Tensor):
+            dist_matrix = dist.clone()
+            if not torch.is_floating_point(dist_matrix):
+                dist_matrix = dist_matrix.to(dtype=torch.float64)
+        else:
+            dist_matrix = torch.as_tensor(dist, dtype=torch.float64)
         if dist_matrix.ndim != 2 or dist_matrix.shape[0] != dist_matrix.shape[1]:
             raise ValueError("'dist' must be a square pairwise distance matrix.")
         if dist_matrix.shape[0] == 0:
@@ -1415,11 +1420,20 @@ class MultiEmbedding:
                 self.embeddings[i] = model.map(embedding)
 
     def distance_matrix(self,
-                        func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean) -> torch.Tensor:
+                        method: str = "agg",
+                        func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean,
+                        max_iter: int = 1000,
+                        tol: float = 1e-10,
+                        sigma_max: float = 3.0) -> torch.Tensor:
         """
         Computes the aggregated distance matrix from all embeddings, accommodating for different-sized matrices.
         Parameters:
+            method (str): Aggregation method. Use "agg" for func-based aggregation
+                or "fp" for Gaussian fixed-point aggregation.
             func (Callable[[torch.Tensor], torch.Tensor]): Function to compute the aggregate. Default is torch.nanmean.
+            max_iter (int): Maximum fixed-point iterations when method="fp".
+            tol (float): Fixed-point convergence tolerance.
+            sigma_max (float): Gaussian weighting scale when method="fp".
         Returns:
             torch.Tensor: The aggregated distance matrix.
         """
@@ -1448,56 +1462,16 @@ class MultiEmbedding:
             stacked_matrices[emb_idx, idx[:, None], idx] = dm
         # Clear results to free memory
         del results
-        # Compute aggregation
-        agg_distance_matrix = func(stacked_matrices, dim=0)
-        if isinstance(agg_distance_matrix, tuple):
-            agg_distance_matrix = agg_distance_matrix[0]
-        # Free large tensor immediately
-        del stacked_matrices
-        # Identify NaN positions
-        nan_mask = torch.isnan(agg_distance_matrix)
-        if nan_mask.any():
-            # Clone once for stable reference values
-            agg_clone = agg_distance_matrix.clone()
-            valid_mask = ~nan_mask
-            # Get NaN indices as tuple for efficient indexing
-            nan_rows, nan_cols = torch.where(nan_mask)
-            # Pre-compute row and column valid masks to avoid recomputation
-            # This is a memory vs speed tradeoff - caching saves repeated mask operations
-            def compute_replacement(k):
-                i, j = nan_rows[k].item(), nan_cols[k].item()
-                # Use pre-computed valid_mask for fast boolean indexing
-                row_vals = agg_clone[i, valid_mask[i]]
-                col_vals = agg_clone[valid_mask[:, j], j]
-                if row_vals.numel() == 0 and col_vals.numel() == 0:
-                    return None
-                # Combine and compute - avoid creating intermediate tensor if one is empty
-                combined = (col_vals if row_vals.numel() == 0 else
-                            row_vals if col_vals.numel() == 0 else
-                            torch.cat((row_vals, col_vals)))
-                result = func(combined)
-                if isinstance(result, tuple):
-                    result = result[0]
-                return result.item() if result.numel() == 1 else result
 
-            # Parallel NaN replacement computation
-            num_nans = len(nan_rows)
-            # Only parallelize if there are enough NaNs to justify overhead
-            if num_nans > 100:
-                replacements = Parallel(n_jobs=-1, prefer="threads", batch_size="auto")(
-                    delayed(compute_replacement)(k) for k in range(num_nans)
-                )
-                # Apply replacements in batch
-                for k, val in enumerate(replacements):
-                    if val is not None:
-                        agg_distance_matrix[nan_rows[k], nan_cols[k]] = val
-            else:
-                # Sequential for small number of NaNs (avoid parallel overhead)
-                for k in range(num_nans):
-                    val = compute_replacement(k)
-                    if val is not None:
-                        agg_distance_matrix[nan_rows[k], nan_cols[k]] = val
-            del agg_clone
+        agg_distance_matrix, _ = utils.aggregate_distance_stack(
+            stacked_matrices,
+            method=method,
+            func=func,
+            max_iter=max_iter,
+            tol=tol,
+            sigma_max=sigma_max,
+        )
+        del stacked_matrices
 
         self._log_info("Computed distance matrix with NaN replacements.")
         return agg_distance_matrix, all_labels
@@ -1514,6 +1488,10 @@ class MultiEmbedding:
                 'lr_fn': None,
                 'weight_exp_fn': None,
                 'func' : torch.nanmean,
+                'method': 'agg',
+                'max_iter': 1000,
+                'tol': 1e-10,
+                'sigma_max': 3.0,
                 'save_embedding': True,
                 'output_dir': None,
             }.items()
@@ -1522,8 +1500,17 @@ class MultiEmbedding:
         geometry = 'hyperbolic' if self.curvature < 0 else 'euclidean'
         
         try:
-            dist_mat = self.distance_matrix(func=params['func'])[0]
-            helper_params = {k: v for k, v in params.items() if k != 'func'}
+            dist_mat = self.distance_matrix(
+                method=params['method'],
+                func=params['func'],
+                max_iter=params['max_iter'],
+                tol=params['tol'],
+                sigma_max=params['sigma_max'],
+            )[0]
+            helper_params = {
+                k: v for k, v in params.items()
+                if k not in {'func', 'method', 'max_iter', 'tol', 'sigma_max'}
+            }
             if geometry == 'hyperbolic':
                 helper_params['curvature'] = self.curvature
             embedding = Embedding.from_distance_matrix(

@@ -6,11 +6,101 @@ from torch import Tensor
 import scipy.linalg as la
 import torch.optim as optim
 import scipy.sparse.linalg as spla
-from typing import Optional, Any, Tuple, List
+from typing import Optional, Any, Tuple, List, Callable
 
 import htree.conf as conf
 import htree.embedding as embedding
 from joblib import Parallel, delayed
+###########################################################################
+def _unwrap_aggregation_result(result: torch.Tensor | tuple) -> torch.Tensor:
+    """Extract tensor values from reducers such as torch.nanmedian."""
+    return result[0] if isinstance(result, tuple) else result
+###########################################################################
+def _fill_missing_distances(
+    distance_matrix: torch.Tensor,
+    func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean,
+) -> torch.Tensor:
+    """Interpolate NaN entries from the corresponding row and column aggregates."""
+    nan_mask = torch.isnan(distance_matrix)
+    if not nan_mask.any():
+        return distance_matrix
+
+    row_values = _unwrap_aggregation_result(func(distance_matrix, dim=1))
+    col_values = _unwrap_aggregation_result(func(distance_matrix, dim=0))
+    replacements = 0.5 * (row_values[:, None] + col_values[None, :])
+    distance_matrix = torch.where(nan_mask, replacements, distance_matrix)
+    distance_matrix.fill_diagonal_(0.0)
+    return distance_matrix
+###########################################################################
+def aggregate_distance_stack(
+    dist_stack: torch.Tensor,
+    method: str = "agg",
+    func: Callable[[torch.Tensor], torch.Tensor] = torch.nanmean,
+    max_iter: int = 1000,
+    tol: float = 1e-10,
+    sigma_max: float = 3.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Aggregate aligned pairwise distance matrices.
+
+    dist_stack has shape (n_matrices, n_labels, n_labels), with missing
+    distances represented as NaN.
+    """
+    if isinstance(func, str):
+        if method != "agg":
+            raise ValueError("Specify only one of method or string func.")
+        method, func = func, torch.nanmean
+    if method not in {"agg", "fp"}:
+        raise ValueError("Invalid method. Choose either 'agg' or 'fp'.")
+    if dist_stack.ndim != 3:
+        raise ValueError("'dist_stack' must have shape (n_matrices, n_labels, n_labels).")
+    if sigma_max <= 0:
+        raise ValueError("'sigma_max' must be positive.")
+
+    valid_mask = ~torch.isnan(dist_stack)
+    confidence = valid_mask.float().mean(dim=0)
+
+    if method == "agg":
+        agg = _unwrap_aggregation_result(func(dist_stack, dim=0))
+        return _fill_missing_distances(agg, func), confidence
+
+    median = _unwrap_aggregation_result(torch.nanmedian(dist_stack, dim=0))
+    D = _fill_missing_distances(median, torch.nanmedian)
+    D.fill_diagonal_(0.0)
+
+    dist_clean = dist_stack.nan_to_num(0.0)
+    valid_float = valid_mask.to(dtype=dist_clean.dtype)
+    neg_inv_2sigma2 = -0.5 / (sigma_max ** 2)
+    G_prev, D_prev = None, None
+
+    for _ in range(max_iter):
+        residuals = dist_clean - D.unsqueeze(0)
+        weights = torch.exp(residuals.square().mul_(neg_inv_2sigma2)).mul_(valid_float)
+        weight_sum = weights.sum(dim=0)
+        G = weights.mul(dist_clean).sum(dim=0).div_(weight_sum.clamp(min=tol))
+        G = torch.where(weight_sum > 0, G, torch.full_like(G, float('nan')))
+        G = _fill_missing_distances(G, torch.nanmedian)
+        G.fill_diagonal_(0.0)
+
+        F = G - D
+        if F.abs().max().item() < tol:
+            D = G
+            break
+
+        D_new = G
+        if G_prev is not None:
+            dG, dD = G - G_prev, D - D_prev
+            dF = dG - dD
+            dF_flat, F_flat = dF.reshape(-1), F.reshape(-1)
+            denom = dF_flat.dot(dF_flat)
+            if denom > tol:
+                theta = torch.clamp(-F_flat.dot(dF_flat) / denom, min=-0.5, max=2.0)
+                D_new = G + theta * dG
+
+        G_prev, D_prev, D = G, D, D_new
+        D.fill_diagonal_(0.0)
+
+    return D, confidence
 ###########################################################################
 def _project_to_hyperboloid(
     embedding: np.ndarray, 
