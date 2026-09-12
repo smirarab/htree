@@ -220,11 +220,15 @@ class HyperbolicProcrustes:
                 # Apply the current rotation and translation to the source points
                 srouce_embedding._points = self.map_to_rotation(R) @ src_points.clone()
                 srouce_embedding.translate(b_new)
-                # Compute the cost function
-                cost = sum(
-                    torch.abs(srouce_embedding.poincare_distance(srouce_embedding._points[:, n], target_embedding._points[:, n]))**(self.p)
-                    for n in range(srouce_embedding.n_points)
+                # Compute the cost in the Loid model. At this point both
+                # embeddings have Loid coordinates, so Poincare distance would
+                # use the wrong metric.
+                lorentz_inner = (
+                    srouce_embedding._points[0] * target_embedding._points[0]
+                    - torch.sum(srouce_embedding._points[1:] * target_embedding._points[1:], dim=0)
                 )
+                distances = torch.acosh(torch.clamp(lorentz_inner, min=1.0 + conf.EPSILON))
+                cost = torch.sum(torch.abs(distances) ** self.p)
                 cost.backward(retain_graph=True)
                 # Orthogonal projection of rotation matrix
                 with torch.no_grad():
