@@ -747,16 +747,66 @@ class MultiTree:
             **kwargs,
         )
     
-    def normalize(self, batch_mode: bool = False) -> List[float]:
+    def normalize(
+        self,
+        batch_mode: bool = False,
+        method: str = "variance",
+        min_shared_taxa: int = 10,
+        max_pairs_per_comparison: Optional[int] = 5000,
+    ) -> List[float]:
         """
         Normalize branch lengths across all trees.
-        Optimizes scale factors so that the weighted average distance
-        matrix has minimal variance. Each tree's branch lengths are
-        multiplied by its optimal scale factor.
+
         Parameters
         ----------
         batch_mode : bool, default=False
             Unused, kept for API compatibility.
+        method : {"variance", "pairwise"}, default="variance"
+            ``"variance"`` keeps the original behavior and optimizes scale
+            factors so the weighted average distance matrix has minimal
+            variance. ``"pairwise"`` estimates each tree's relative rate from
+            median log distance ratios against other trees on shared taxa.
+        min_shared_taxa : int, default=10
+            Minimum number of shared taxa required for a pairwise tree
+            comparison when ``method="pairwise"``.
+        max_pairs_per_comparison : int or None, default=5000
+            Maximum number of shared taxon pairs used for one pairwise
+            comparison. If None, all shared pairs are used.
+
+        Each tree's branch lengths are multiplied by its inferred scale factor.
+
+        Returns
+        -------
+        List[float]
+            Scale factors applied to each tree.
+        """
+        if method == "variance":
+            return self._normalize_variance(batch_mode=batch_mode)
+        if method == "pairwise":
+            return self._normalize_pairwise(
+                min_shared_taxa=min_shared_taxa,
+                max_pairs_per_comparison=max_pairs_per_comparison,
+            )
+        raise ValueError("method must be either 'variance' or 'pairwise'.")
+
+    def _apply_normalization_scales(self, final_scales: List[float]) -> None:
+        Parallel(n_jobs=-1, prefer="threads")(
+            delayed(lambda t, s: [node.set_edge_length(node.get_edge_length() * s)
+                                  for node in t.contents.traverse_postorder()
+                                  if node.get_edge_length() is not None])(tree, scale)
+            for tree, scale in zip(self.trees, final_scales)
+        )
+
+    def _normalize_variance(self, batch_mode: bool = False) -> List[float]:
+        """
+        Normalize branch lengths using the original variance-minimization
+        objective.
+
+        Parameters
+        ----------
+        batch_mode : bool, default=False
+            Unused, kept for API compatibility.
+
         Returns
         -------
         List[float]
@@ -809,12 +859,94 @@ class MultiTree:
         # Compute final scales and apply to trees
         raw_scales = torch.nn.functional.softplus(params)
         final_scales = (raw_scales * (n_trees / raw_scales.sum())).tolist()
-        Parallel(n_jobs=-1, prefer="threads")(
-            delayed(lambda t, s: [node.set_edge_length(node.get_edge_length() * s) 
-                                  for node in t.contents.traverse_postorder() 
-                                  if node.get_edge_length() is not None])(tree, scale)
-            for tree, scale in zip(self.trees, final_scales)
+        self._apply_normalization_scales(final_scales)
+        return final_scales
+
+    def _normalize_pairwise(
+        self,
+        min_shared_taxa: int = 10,
+        max_pairs_per_comparison: Optional[int] = 5000,
+    ) -> List[float]:
+        """
+        Normalize branch lengths from pairwise median distance ratios.
+
+        For each pair of trees, this compares only their shared taxa and
+        estimates the log scale needed to make one tree's pairwise distances
+        match the other's. Per-tree log rates are weighted by the number of
+        shared taxon pairs and centered to geometric mean one.
+        """
+        if min_shared_taxa < 2:
+            raise ValueError("min_shared_taxa must be at least 2.")
+        if max_pairs_per_comparison is not None and max_pairs_per_comparison < 1:
+            raise ValueError("max_pairs_per_comparison must be positive or None.")
+
+        n_trees = len(self.trees)
+        if n_trees == 0:
+            return []
+
+        results = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(lambda t: (t.terminal_names(), t.distance_matrix()[0]))(tree)
+            for tree in self.trees
         )
+        tree_labels = [labels for labels, _ in results]
+        dist_matrices = [dist for _, dist in results]
+        label_maps = [{label: idx for idx, label in enumerate(labels)} for labels in tree_labels]
+
+        laplacian = torch.zeros((n_trees, n_trees), dtype=torch.float64)
+        rhs = torch.zeros(n_trees, dtype=torch.float64)
+
+        for i in tqdm(range(n_trees), desc="Pairwise normalizing"):
+            labels_i = tree_labels[i]
+            map_j_candidates = set(labels_i)
+            for j in range(i + 1, n_trees):
+                shared = [label for label in tree_labels[j] if label in map_j_candidates]
+                if len(shared) < min_shared_taxa:
+                    continue
+
+                idx_i = torch.tensor([label_maps[i][label] for label in shared], dtype=torch.long)
+                idx_j = torch.tensor([label_maps[j][label] for label in shared], dtype=torch.long)
+                tri = torch.triu_indices(len(shared), len(shared), offset=1)
+                if max_pairs_per_comparison is not None and tri.shape[1] > max_pairs_per_comparison:
+                    select = torch.linspace(
+                        0,
+                        tri.shape[1] - 1,
+                        steps=max_pairs_per_comparison,
+                        dtype=torch.long,
+                    )
+                    tri = tri[:, select]
+
+                dist_i = dist_matrices[i][idx_i[tri[0]], idx_i[tri[1]]].double()
+                dist_j = dist_matrices[j][idx_j[tri[0]], idx_j[tri[1]]].double()
+                valid = (dist_i > 0) & (dist_j > 0) & torch.isfinite(dist_i) & torch.isfinite(dist_j)
+                if not torch.any(valid):
+                    continue
+
+                log_ratio = torch.log(dist_j[valid]) - torch.log(dist_i[valid])
+                pair_log_scale = torch.median(log_ratio)
+                weight = float(valid.sum().item())
+
+                laplacian[i, i] += weight
+                laplacian[j, j] += weight
+                laplacian[i, j] -= weight
+                laplacian[j, i] -= weight
+                rhs[i] += pair_log_scale * weight
+                rhs[j] -= pair_log_scale * weight
+
+        final_scales = torch.ones(n_trees, dtype=torch.float64)
+        observed = torch.diagonal(laplacian) > 0
+        if torch.any(observed):
+            obs_idx = torch.nonzero(observed, as_tuple=False).flatten()
+            sub_laplacian = laplacian[obs_idx[:, None], obs_idx]
+            sub_rhs = rhs[obs_idx]
+            centering = torch.ones_like(sub_laplacian) / len(obs_idx)
+            log_rates_obs = torch.linalg.solve(sub_laplacian + centering, sub_rhs)
+            log_rates = torch.zeros(n_trees, dtype=torch.float64)
+            log_rates[obs_idx] = log_rates_obs
+            log_rates[observed] -= log_rates[observed].mean()
+            final_scales[observed] = torch.exp(log_rates[observed])
+
+        final_scales = final_scales.tolist()
+        self._apply_normalization_scales(final_scales)
         return final_scales
     
     def embed(
